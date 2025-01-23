@@ -1,0 +1,111 @@
+name: "Deploy Package to codeBuild"
+description: "Using an S3 Bucket artifact to trigger an AWS codeBuild."
+
+inputs:
+  aws-access-key-id:
+    description: "The AWS Access Key ID."
+    type: string
+    required: true
+
+  aws-secret-access-key:
+    description: "The AWS Secret Access Key."
+    type: string
+    required: true
+
+  aws-session-token:
+    description: "The AWS Session Token."
+    type: string
+    required: true
+
+  build-version:
+    description: "The build version."
+    type: string
+    required: true
+
+  s3-bucket:
+    description: "The S3 Bucket name."
+    type: string
+    required: true
+
+  aws-region:
+    description: "The AWS deployment region."
+    type: string
+    required: false
+    default: "eu-west-1"
+
+  package-name:
+    description: "The name of the zip package within the S3 Bucket release."
+    type: string
+    required: false
+    default: "package.zip"
+
+  application-name:
+    description: "The name of the application in AWS CodeBuild."
+    type: string
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Create CodeBuild Deployment
+      id: create_deployment
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+        AWS_SESSION_TOKEN: ${{ inputs.aws-session-token }}
+        AWS_REGION: ${{ inputs.aws-region }}
+      shell: bash
+      run: |
+        repositoryName="${GITHUB_REPOSITORY#*/}"
+        s3bucketpath="packages/$repositoryName/${{ inputs.build-version }}/${{ inputs.package-name }}"
+        
+        if [[ -z "${{ inputs.application-name }}" ]]; then
+          application="$repositoryName"
+          echo "Using repository name $application as the application name."
+        else
+          application="${{ inputs.application-name }}"
+          echo "Using provided application name: $application"
+        fi
+
+        echo "Start CodeBuild: $application"
+        start_codebuild=$(aws codebuild start-build \
+          --project-name "$application" \
+          --environment-variables-override name=S3_LOCATION,value="${{ inputs.s3-bucket }}" name=S3_KEY,value="$s3bucketpath" \
+          --region "${{ inputs.aws-region }}")
+
+        if [[ $? -ne 0 ]]; then
+          echo "Error: Failed to create CodeBuild application $application"
+          exit 1
+        fi
+
+        codebuildid=$(echo "$start_codebuild" | jq -r ".build.id")
+        echo "Triggered CodeBuild Deployment: $codebuildid"
+        echo "CODEBUILD_ID=$codebuildid" >> $GITHUB_ENV
+
+    - name: Confirm CodeBuild Deployment
+      id: confirm_deployment
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+        AWS_SESSION_TOKEN: ${{ inputs.aws-session-token }}
+        AWS_REGION: ${{ inputs.aws-region }}
+      shell: bash
+      run: |
+        while true; do
+          BUILD_INFO=$(aws codebuild batch-get-builds --ids "${{ env.CODEBUILD_ID }}")
+          BUILD_STATUS=$(echo "$BUILD_INFO" | jq -r ".builds[0].buildStatus")
+          CURRENT_PHASE=$(echo "$BUILD_INFO" | jq -r ".builds[0].currentPhase")
+
+          echo "status: $BUILD_STATUS; phase: $CURRENT_PHASE"
+
+          if [[ "$BUILD_STATUS" == "SUCCEEDED" ]]; then
+            break
+          elif [[ "$BUILD_STATUS" == "FAILED" || "$BUILD_STATUS" == "STOPPED" || -z "$BUILD_STATUS" ]]; then
+            echo "Error: Build failed or stopped. Status: $BUILD_STATUS, Phase: $CURRENT_PHASE"
+            exit 1
+          fi
+
+          sleep 5
+        done
+
+        echo "Deploy S3 Bucket Package to CodeBuild successfully."
